@@ -72,7 +72,15 @@ fn build_ffi() -> miette::Result<()> {
     let path_cxx = std::path::PathBuf::from("cxx"); // include path
 
     let mut build = autocxx_build::Builder::new("src/ffi.rs", [&path_src, &path_cxx])
-        .extra_clang_args(&["-std=c++17"])
+        // LLVM 18's x86intrin.h pulls mm3dnow.h while bindgen is parsing the
+        // sux headers, but libclang does not expose the old 3DNow builtins.
+        // sux does not need x86intrin.h on clang/GCC, so bindgen gets a shim
+        // while the real C++ compilation still uses the system header.
+        .extra_clang_args(&[
+            "-std=c++17",
+            "-DCBL_AUTOCXX_BINDGEN",
+            "-Icxx/autocxx-compat",
+        ])
         .build()?;
     build
         .flag_if_supported("-std=c++17")
