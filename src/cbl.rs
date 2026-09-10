@@ -170,6 +170,27 @@ macro_rules! impl_cbl {
                 self.wordset.count()
             }
 
+            /// Libere la capacite excedentaire du tableau de conteneurs.
+            ///
+            /// Voir [`WordSet::shrink_to_fit`]. Realloue et copie : a appeler
+            /// une fois les insertions terminees, pas dans une boucle.
+            pub fn shrink_to_fit(&mut self) {
+                self.wordset.shrink_to_fit()
+            }
+
+            /// Occupation du tableau de conteneurs : (utilises, capacite).
+            pub fn containers_load(&self) -> (usize, usize) {
+                self.wordset.containers_load()
+            }
+
+            /// Instrumentation A1 : rapport d'occupation memoire de l'index.
+            ///
+            /// Voir [`WordSet::memory_report`]. Parcourt tous les tries,
+            /// a n'appeler qu'a la demande.
+            pub fn memory_report(&self) -> String {
+                self.wordset.memory_report()
+            }
+
             /// Returns `true` if there are no *k*-mers in the set.
             #[inline]
             pub fn is_empty(&self) -> bool {

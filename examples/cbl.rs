@@ -19,6 +19,152 @@ pub mod constants {
 
 use constants::{K, PREFIX_BITS, T};
 
+// ============================================================================
+// Allocateur instrumente (profilage memoire, portable macOS / Linux).
+// Compte chaque allocation par classe de taille, sans jamais allouer lui-meme.
+// Defini dans l'EXEMPLE : la bibliotheque cbl n'est pas modifiee.
+// ============================================================================
+mod allocstats {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    const CLASSES: usize = 48;
+    static COUNT: [AtomicUsize; CLASSES] = [const { AtomicUsize::new(0) }; CLASSES];
+    static BYTES: [AtomicUsize; CLASSES] = [const { AtomicUsize::new(0) }; CLASSES];
+    static NALLOC: AtomicUsize = AtomicUsize::new(0);
+    static NREALLOC: AtomicUsize = AtomicUsize::new(0);
+    static REQ: AtomicUsize = AtomicUsize::new(0);
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    #[inline]
+    fn class_of(size: usize) -> usize {
+        if size <= 1 {
+            0
+        } else {
+            (usize::BITS - (size - 1).leading_zeros()) as usize
+        }
+    }
+    #[inline]
+    fn note(size: usize) {
+        let c = class_of(size).min(CLASSES - 1);
+        COUNT[c].fetch_add(1, Relaxed);
+        BYTES[c].fetch_add(size, Relaxed);
+        NALLOC.fetch_add(1, Relaxed);
+        REQ.fetch_add(size, Relaxed);
+        let live = LIVE.fetch_add(size, Relaxed) + size;
+        PEAK.fetch_max(live, Relaxed);
+    }
+    #[inline]
+    fn unnote(size: usize) {
+        LIVE.fetch_sub(size, Relaxed);
+    }
+
+    pub struct Counting;
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            note(l.size());
+            System.alloc(l)
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            note(l.size());
+            System.alloc_zeroed(l)
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            unnote(l.size());
+            System.dealloc(p, l)
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            unnote(l.size());
+            note(new);
+            NREALLOC.fetch_add(1, Relaxed);
+            System.realloc(p, l, new)
+        }
+    }
+
+    /// Arrondi a la classe reelle de l'allocateur systeme.
+    /// macOS : quanta de 16 o jusqu'a 1008 o, puis 512 o. glibc : 16 o, minimum 32 o.
+    fn rounded(size: usize) -> usize {
+        if cfg!(target_os = "macos") {
+            if size == 0 {
+                16
+            } else if size <= 1008 {
+                size.div_ceil(16) * 16
+            } else if size <= 127 * 1024 {
+                size.div_ceil(512) * 512
+            } else {
+                size.div_ceil(4096) * 4096
+            }
+        } else {
+            let s = size + 8;
+            if s <= 32 {
+                32
+            } else {
+                s.div_ceil(16) * 16
+            }
+        }
+    }
+
+    pub fn report(label: &str) {
+        let n = NALLOC.load(Relaxed);
+        let req = REQ.load(Relaxed);
+        eprintln!("\n===== PROFIL MEMOIRE : {label} =====");
+        eprintln!("allocations             : {n}");
+        eprintln!("reallocations           : {}", NREALLOC.load(Relaxed));
+        eprintln!("octets demandes (cumul) : {:.3} Go", req as f64 / 1e9);
+        eprintln!("pic vivant (demande)    : {:.3} Go", PEAK.load(Relaxed) as f64 / 1e9);
+        eprintln!("vivant a la fin         : {:.3} Go", LIVE.load(Relaxed) as f64 / 1e9);
+        eprintln!(
+            "\n{:>10} {:>14} {:>12} {:>9} {:>13} {:>9}",
+            "classe", "allocations", "demande Mo", "% alloc", "arrondi Mo", "surcout"
+        );
+        let mut tot_req = 0usize;
+        let mut tot_round = 0usize;
+        let mut small_round = 0usize;
+        for c in 0..CLASSES {
+            let k = COUNT[c].load(Relaxed);
+            if k == 0 {
+                continue;
+            }
+            let b = BYTES[c].load(Relaxed);
+            let mid = if c == 0 { 1 } else { 1usize << c };
+            let avg = (b / k).max(1);
+            let r = k * rounded(avg);
+            tot_req += b;
+            tot_round += r;
+            if mid <= 64 {
+                small_round += r;
+            }
+            eprintln!(
+                "{:>9}o {:>14} {:>11.1}M {:>8.2}% {:>12.1}M {:>8.2}x",
+                mid,
+                k,
+                b as f64 / 1e6,
+                100.0 * k as f64 / n.max(1) as f64,
+                r as f64 / 1e6,
+                r as f64 / b.max(1) as f64
+            );
+        }
+        eprintln!(
+            "{:>10} {:>14} {:>11.1}M {:>9} {:>12.1}M {:>8.2}x",
+            "TOTAL",
+            n,
+            tot_req as f64 / 1e6,
+            "",
+            tot_round as f64 / 1e6,
+            tot_round as f64 / tot_req.max(1) as f64
+        );
+        eprintln!(
+            "\nclasses <= 64 o (allocations PAR SEAU) : {:.1} Mo arrondis, soit {:.1} % du total",
+            small_round as f64 / 1e6,
+            100.0 * small_round as f64 / tot_round.max(1) as f64
+        );
+    }
+}
+
+#[global_allocator]
+static ALLOC: allocstats::Counting = allocstats::Counting;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = formatcp!("CBL compiled for K={K}"), long_about = None)]
 struct Cli {
@@ -32,6 +178,8 @@ enum Command {
     Build(BuildArgs),
     /// Count the k-mers contained in an index
     Count(IndexArgs),
+    /// Print a memory usage report of an index (instrumentation A1)
+    Mem(IndexArgs),
     /// List the k-mers contained in an index
     List(ListArgs),
     /// Query an index for every k-mer contained in a FASTA/Q file
@@ -161,6 +309,16 @@ fn main() {
                 let seqrec = record.unwrap_or_else(|_| panic!("Invalid record"));
                 cbl.insert_seq(&seqrec.seq());
             }
+            {
+                let (used, cap) = cbl.containers_load();
+                eprintln!(
+                    "conteneurs : {used} utilises / {cap} alloues ({:.1} % de remplissage)",
+                    100.0 * used as f64 / cap.max(1) as f64
+                );
+            }
+            allocstats::report("apres build, AVANT shrink_to_fit");
+            cbl.shrink_to_fit();
+            allocstats::report("apres build, APRES shrink_to_fit");
             if let Some(output_filename) = args.output {
                 write_index(&cbl, output_filename.as_str());
             }
@@ -173,6 +331,29 @@ fn main() {
             } else {
                 eprintln!("It contains {} {K}-mers", cbl.count());
             }
+        }
+        Command::Mem(args) => {
+            let index_filename = args.index.as_str();
+            let mut cbl: CBL<K, T, PREFIX_BITS> = read_index(index_filename);
+            eprintln!("Memory report for {index_filename} (K={K})");
+            print!("{}", cbl.memory_report());
+            {
+                let (used, cap) = cbl.containers_load();
+                eprintln!(
+                    "conteneurs : {used} utilises / {cap} alloues ({:.1} % de remplissage)",
+                    100.0 * used as f64 / cap.max(1) as f64
+                );
+            }
+            allocstats::report("index charge, AVANT shrink_to_fit");
+            cbl.shrink_to_fit();
+            {
+                let (used, cap) = cbl.containers_load();
+                eprintln!(
+                    "conteneurs : {used} utilises / {cap} alloues ({:.1} % de remplissage)",
+                    100.0 * used as f64 / cap.max(1) as f64
+                );
+            }
+            allocstats::report("index charge, APRES shrink_to_fit");
         }
         Command::List(args) => {
             let index_filename = args.index.as_str();

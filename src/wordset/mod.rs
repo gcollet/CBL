@@ -307,6 +307,162 @@ where
             suffix: None,
         }
     }
+
+    /// Libere la capacite excedentaire du tableau de conteneurs.
+    ///
+    /// `suffix_containers` croit par doublement : a la fin d'une construction
+    /// il peut etre rempli a ~55 % seulement (mesure : 18,67 M seaux utilises
+    /// pour 2^25 = 33,55 M emplacements alloues). Cette methode rend la
+    /// difference au systeme.
+    ///
+    /// Attention : `shrink_to_fit` REALLOUE et COPIE. Pendant l'appel, l'ancien
+    /// et le nouveau tampon coexistent, donc le PIC de memoire augmente meme si
+    /// l'occupation finale baisse. A n'appeler que lorsque les insertions sont
+    /// terminees, typiquement juste avant la serialisation.
+    pub fn shrink_to_fit(&mut self) {
+        self.suffix_containers.shrink_to_fit();
+        self.empty_containers.shrink_to_fit();
+    }
+
+    /// Occupation du tableau de conteneurs : (utilises, capacite alloues).
+    /// Sert a mesurer ce que `shrink_to_fit` peut rendre.
+    pub fn containers_load(&self) -> (usize, usize) {
+        (
+            self.suffix_containers.len(),
+            self.suffix_containers.capacity(),
+        )
+    }
+
+    /// Instrumentation A1 : ou part la memoire de l'index ?
+    ///
+    /// Renvoie un rapport texte : repartition des k-mers entre seaux stockes
+    /// en `Vec` et seaux stockes en `Trie`, nombre de noeuds de trie, octets
+    /// par couche, et histogramme des tailles de seau.
+    ///
+    /// Cout : parcourt tous les tries (`count_nodes` est recursif).
+    /// A n'appeler qu'a la demande, jamais dans un chemin critique.
+    pub fn memory_report(&self) -> String {
+        // Couts unitaires lus dans le code de CBL :
+        //   TrieNode = TinyBitvector([u64; 4]) = 32 o  +  Vec<Trie> = 24 o  => 56 o
+        //   chaque enfant coute 8 o (slot du Vec parent) + 8 o (Box)
+        const NODE_BYTES: usize = 56;
+        const CHILD_PTR: usize = 16;
+        const VEC_HEADER: usize = 24;
+
+        let sb = Self::SUFFIX_BITS.div_ceil(8);
+
+        let mut n_vec = 0usize;
+        let mut n_trie = 0usize;
+        let mut k_vec = 0usize;
+        let mut k_trie = 0usize;
+        let mut b_vec = 0usize;
+        let mut b_trie = 0usize;
+        let mut nodes_total = 0usize;
+        let mut max_bucket = 0usize;
+        let mut hist = [0usize; 32]; // k-mers par classe log2 de taille de seau
+
+        for c in self.suffix_containers.iter() {
+            let len = c.len();
+            if len == 0 {
+                continue;
+            }
+            if len > max_bucket {
+                max_bucket = len;
+            }
+            let class = ((usize::BITS - len.leading_zeros()) as usize).min(31);
+            hist[class] += len;
+            if len > Self::THRESHOLD {
+                n_trie += 1;
+                k_trie += len;
+                let nodes = c.count_nodes();
+                nodes_total += nodes;
+                b_trie += VEC_HEADER + nodes * (NODE_BYTES + CHILD_PTR);
+            } else {
+                n_vec += 1;
+                k_vec += len;
+                b_vec += VEC_HEADER + len * sb;
+            }
+        }
+
+        let m = (k_vec + k_trie).max(1);
+        let b_prefix = (1usize << Self::PREFIX_BITS) / 8;
+        let b_tiered = 8 * self.prefixes.count(); // 1 pointeur par prefixe occupe (MINORANT)
+        let b_total = b_prefix + b_tiered + b_vec + b_trie;
+
+        let pct = |x: usize| 100.0 * (x as f64) / (m as f64);
+        let bits = |b: usize| 8.0 * (b as f64) / (m as f64);
+
+        let mut s = String::new();
+        s.push_str(&format!(
+            "PREFIX_BITS={}  SUFFIX_BITS={} ({} o/suffixe)  THRESHOLD={}\n",
+            Self::PREFIX_BITS,
+            Self::SUFFIX_BITS,
+            sb,
+            Self::THRESHOLD
+        ));
+        s.push_str(&format!("k-mers                 : {}\n", m));
+        s.push_str(&format!(
+            "seaux occupes          : {} (vec {}, trie {})\n",
+            n_vec + n_trie,
+            n_vec,
+            n_trie
+        ));
+        s.push_str(&format!("plus gros seau         : {}\n", max_bucket));
+        s.push_str(&format!(
+            "k-mers en mode vec     : {} ({:.2} %)\n",
+            k_vec,
+            pct(k_vec)
+        ));
+        s.push_str(&format!(
+            "k-mers en mode trie    : {} ({:.2} %)   <== PLAFOND DE LA PISTE\n",
+            k_trie,
+            pct(k_trie)
+        ));
+        s.push_str(&format!(
+            "noeuds de trie         : {} ({:.4} noeud / k-mer en trie)\n",
+            nodes_total,
+            (nodes_total as f64) / (k_trie.max(1) as f64)
+        ));
+        s.push_str("--- memoire : octets, puis bits/k-mer rapportes a TOUT l'index ---\n");
+        s.push_str(&format!(
+            "bitvector prefixes     : {:>16} o  {:>9.4} b/kmer\n",
+            b_prefix,
+            bits(b_prefix)
+        ));
+        s.push_str(&format!(
+            "tiered vector (minorant): {:>15} o  {:>9.4} b/kmer\n",
+            b_tiered,
+            bits(b_tiered)
+        ));
+        s.push_str(&format!(
+            "suffixes en vec        : {:>16} o  {:>9.4} b/kmer\n",
+            b_vec,
+            bits(b_vec)
+        ));
+        s.push_str(&format!(
+            "tries                  : {:>16} o  {:>9.4} b/kmer   ({:.2} % du total)\n",
+            b_trie,
+            bits(b_trie),
+            100.0 * (b_trie as f64) / (b_total.max(1) as f64)
+        ));
+        s.push_str(&format!(
+            "TOTAL                  : {:>16} o  {:>9.4} b/kmer\n",
+            b_total,
+            bits(b_total)
+        ));
+        s.push_str("--- repartition des k-mers par taille de seau ---\n");
+        for i in 0..32 {
+            if hist[i] > 0 {
+                s.push_str(&format!(
+                    "  taille < 2^{:<2} : {:>16} ({:.2} %)\n",
+                    i,
+                    hist[i],
+                    pct(hist[i])
+                ));
+            }
+        }
+        s
+    }
 }
 
 impl<const PREFIX_BITS: usize, const SUFFIX_BITS: usize> Default
